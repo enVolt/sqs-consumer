@@ -5,6 +5,7 @@ import debug from 'debug';
 import { EventEmitter } from 'events';
 import { autoBind } from './bind';
 import { SQSError, TimeoutError } from './errors';
+import { RateLimiterStoreAbstract } from 'rate-limiter-flexible';
 
 const log = debug('sqs-consumer');
 
@@ -33,6 +34,12 @@ function createTimeout(duration: number): TimeoutResonse[] {
   return [timeout, pending];
 }
 
+function waitPromise(duration: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, duration);
+  });
+}
+
 function assertOptions(options: ConsumerOptions): void {
   requiredOptions.forEach((option) => {
     const possibilities = option.split('|');
@@ -43,6 +50,10 @@ function assertOptions(options: ConsumerOptions): void {
 
   if (options.batchSize > 10 || options.batchSize < 1) {
     throw new Error('SQS batchSize option must be between 1 and 10.');
+  }
+
+  if (options.rateLimiter && options.batchSize > 1) {
+    throw new Error('SQS batchSize option must be 1 only with rateLimiter');
   }
 }
 
@@ -84,6 +95,7 @@ export interface ConsumerOptions {
   handleMessageTimeout?: number;
   handleMessage?(message: SQSMessage): Promise<void>;
   handleMessageBatch?(messages: SQSMessage[]): Promise<void>;
+  rateLimiter?: RateLimiterStoreAbstract;
 }
 
 export class Consumer extends EventEmitter {
@@ -100,6 +112,7 @@ export class Consumer extends EventEmitter {
   private authenticationErrorTimeout: number;
   private terminateVisibilityTimeout: boolean;
   private sqs: SQS;
+  private rateLimiter: RateLimiterStoreAbstract;
 
   constructor(options: ConsumerOptions) {
     super();
@@ -116,6 +129,7 @@ export class Consumer extends EventEmitter {
     this.terminateVisibilityTimeout = options.terminateVisibilityTimeout || false;
     this.waitTimeSeconds = options.waitTimeSeconds || 20;
     this.authenticationErrorTimeout = options.authenticationErrorTimeout || 10000;
+    this.rateLimiter = options.rateLimiter;
 
     this.sqs = options.sqs || new SQS({
       region: options.region || process.env.AWS_REGION || 'eu-west-1'
@@ -256,6 +270,17 @@ export class Consumer extends EventEmitter {
     }
   }
 
+  private async rateLimitPromise(): Promise<T> {
+    try {
+      await this.rateLimiter.consume(this.queueUrl);
+    } catch (e) {
+      if (e.msBeforeNext) {
+
+      }
+      throw e;
+    }
+  }
+
   private poll(): void {
     if (this.stopped) {
       this.emit('stopped');
@@ -273,7 +298,14 @@ export class Consumer extends EventEmitter {
     };
 
     let pollingTimeout = 0;
-    this.receiveMessage(receiveParams)
+    let p;
+    if (this.rateLimiter) {
+      p = this.rateLimitPromise();
+    } else {
+      p = Promise.resolve();
+    }
+
+    p.then(() => this.receiveMessage(receiveParams))
       .then(this.handleSqsResponse)
       .catch((err) => {
         this.emit('error', err);
